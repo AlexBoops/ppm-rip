@@ -5,6 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Paper Mario: The Thousand-Year Door</title>
   <link rel="icon" href="https://ssl.gstatic.com/docs/documents/images/kix-favicon7.ico">
+  <script>
+    // Configure coi-serviceworker to use credentialless COEP so external icons/assets never get blocked
+    window.coi = {
+      coepCredentialless: () => true,
+      quiet: true
+    };
+  </script>
   <script src="coi-serviceworker.js"></script>
   <style>
     :root {
@@ -18,10 +25,8 @@
 
     /* The game fills the window at 4:3 (letterboxed). */
     #screen { position: fixed; inset: 0; background: #000; display: flex; align-items: center; justify-content: center; }
-    /* The game's frames are not 4:3 in pixels (e.g. 640x528): stretch them into the largest 4:3 box. */
     #display, #intro { width: min(100vw, calc(100vh * 4 / 3)); height: min(100vh, calc(100vw * 3 / 4)); display: block;
       outline: none; }
-    /* GameCube startup screen, played before the game starts. */
     #intro { position: absolute; object-fit: contain; background: #000; }
     #intro[hidden] { display: none; }
 
@@ -125,12 +130,9 @@
 </head>
 <body>
   <div id="screen">
-    <!-- frames from the renderer thread are shown here (see sadxPresent in ttyd-page.js) -->
     <canvas id="display" width="1280" height="960" tabindex="0"></canvas>
     <video id="intro" src="loading.mp4" preload="auto" playsinline hidden></video>
-    <!-- the renderer draws into this one from its worker thread; it is never shown directly -->
     <canvas id="canvas" width="1280" height="960" hidden></canvas>
-    <!-- given to the wasm main thread so the real canvas stays free for the renderer thread -->
     <canvas id="sadx-main-thread-canvas" width="1" height="1" hidden></canvas>
     <div id="overlay">
       <div class="card">
