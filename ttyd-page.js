@@ -1,20 +1,63 @@
 // ttyd-page.js - page side of the Paper Mario: The Thousand-Year Door web port (adapted from the SADX
 // port's): keeps the disc image in OPFS, starts the
-// wasm build (sadx.js / sadx.wasm) and shows its log.
+// wasm build (ttyd.js / ttyd.wasm) and shows its log.
 'use strict';
 
 const DISC_NAME = 'ttyd.rvz';
-const DISC_URL = 'disc.rvz';  // next to this page (serve.py: --disc, or disc.rvz next to it)
-// The download starts at once, before anything else. When the browser already has a copy of the
-// same size it is cancelled as soon as the response headers arrive (prepareDisc).
-const discAbort = new AbortController();
-const discResponse = fetch(DISC_URL, { signal: discAbort.signal, cache: 'no-store' })
-  .catch((e) => ({ ok: false, status: 0, error: e }));
+const DISC_BASE = 'disc.rvz';
+const DISC_PARTS = 17; // disc.rvz.part0 through disc.rvz.part16
+const WASM_BASE = 'ttyd.wasm';
+const WASM_PARTS = 5;  // ttyd.wasm.part0 through ttyd.wasm.part4
 const EXPECTED_ID = 'G8ME01';
 
 const $ = (id) => document.getElementById(id);
 const overlay = $('overlay'), message = $('message'), statusEl = $('status'), logEl = $('log');
 const progressWrap = $('progress-wrap'), progressBar = $('progress-bar'), startHint = $('start-hint');
+
+// Reassemble ttyd.wasm.part0..part4 in parallel as soon as the page loads
+let mergedWasmBufferPromise = null;
+function getMergedWasmBuffer() {
+  if (!mergedWasmBufferPromise) {
+    mergedWasmBufferPromise = (async () => {
+      const tasks = Array.from({ length: WASM_PARTS }, (_, i) =>
+        fetch(`${WASM_BASE}.part${i}`, { cache: 'force-cache' }).then((res) => {
+          if (!res.ok) throw new Error(`Could not load ${WASM_BASE}.part${i} (HTTP ${res.status}).`);
+          return res.arrayBuffer();
+        })
+      );
+      const buffers = await Promise.all(tasks);
+      const totalLen = buffers.reduce((sum, b) => sum + b.byteLength, 0);
+      const merged = new Uint8Array(totalLen);
+      let offset = 0;
+      for (const b of buffers) {
+        merged.set(new Uint8Array(b), offset);
+        offset += b.byteLength;
+      }
+      return merged.buffer;
+    })();
+  }
+  return mergedWasmBufferPromise;
+}
+
+// Intercept fetch() for ttyd.wasm so any worker/fallback fetch gets the reassembled binary
+const nativeFetch = window.fetch.bind(window);
+window.fetch = function (input, init) {
+  const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+  if (/(?:^|\/)ttyd\.wasm(?:$|\?)/.test(url)) {
+    return getMergedWasmBuffer().then(
+      (buf) =>
+        new Response(buf, {
+          status: 200,
+          statusText: 'OK',
+          headers: {
+            'Content-Type': 'application/wasm',
+            'Content-Length': String(buf.byteLength),
+          },
+        })
+    );
+  }
+  return nativeFetch(input, init);
+};
 
 // The game can log in bursts; redraw the log at most every 100 ms, and only while the info bar is
 // shown, so the page's main thread (which also shows every game frame) never stalls on it.
@@ -49,13 +92,7 @@ function setProgress(fraction) {
 // ---------------------------------------------------------------------------------------------
 // Settings (localStorage): info bar, keyboard bindings, controller choice and its bindings.
 
-// Every GameCube control with its inputs in the emulator's controller profile (sadx_web_main.cpp
-// DEFAULT_GCPAD_INI): the keyboard key (first key of each line) and the slot of the virtual
-// standard-layout gamepad 0 ("bN" = button N, "aN-"/"aN+" = axis N, negative/positive). The page
-// drives those fixed inputs from whatever the player bound, so bindings change here, instantly,
-// without touching the profile.
 const CONTROLS = [
-  // name, profile key, default keys, profile pad input (also the default pad binding)
   ['A', 'Space', ['Space', 'KeyK'], 'b0'],
   ['B', 'KeyJ', ['KeyJ', 'ShiftLeft'], 'b2'],
   ['X', 'KeyL', ['KeyL'], 'b1'],
@@ -93,8 +130,6 @@ function loadSettings() {
     const pad = saved.pad && saved.pad.binds && saved.pad.binds[canon];
     if (typeof pad === 'string') padBinds[canon] = pad;
   }
-  // Players 1-4: which controller each uses ('none', 'auto' = the next connected one nobody chose,
-  // or 'slotN' = the browser's gamepad slot N), and which player the keyboard drives (-1: none).
   const players = [0, 1, 2, 3].map((i) => {
     const pad = saved.players && saved.players[i] && saved.players[i].pad;
     return { pad: typeof pad === 'string' ? pad : (i === 0 ? 'auto' : 'none') };
@@ -107,7 +142,6 @@ const settings = loadSettings();
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* private mode */ }
 }
-// Physical key (KeyboardEvent.code) -> profile keys of the controls bound to it.
 let keyMap = new Map();
 function rebuildKeyMap() {
   keyMap = new Map();
@@ -129,7 +163,6 @@ function prettyKey(code) {
   if (code.startsWith('Arrow')) return code.slice(5) + ' arrow';
   return code.replace(/(Left|Right)$/, ' $1');
 }
-// Names for the browser's "standard" gamepad layout (Xbox labels; PlayStation in brackets).
 const PAD_BUTTONS = ['A (Cross)', 'B (Circle)', 'X (Square)', 'Y (Triangle)', 'LB (L1)', 'RB (R1)',
   'LT (L2)', 'RT (R2)', 'Back (Share)', 'Start (Options)', 'Left stick press', 'Right stick press',
   'D-pad up', 'D-pad down', 'D-pad left', 'D-pad right', 'Home'];
@@ -147,8 +180,6 @@ function connectedPads() {
   const pads = navigator.getGamepads ? [...navigator.getGamepads()] : [];
   return pads.filter((p) => p && p.connected);
 }
-// The gamepad of each player (null: none): chosen slots first, then 'auto' players take the
-// remaining connected controllers in order.
 function playerPads() {
   const pads = connectedPads();
   const taken = new Set();
@@ -162,13 +193,10 @@ function playerPads() {
   settings.players.forEach((player, i) => { if (player.pad === 'auto') out[i] = free.shift() || null; });
   return out;
 }
-// Ports with a player plugged in (the game sees a controller there): keyboard or any controller
-// choice. Read once at boot ("1100" = players 1 and 2).
 function portMask() {
   return settings.players.map((player, i) =>
     (player.pad !== 'none' || settings.keyboardPlayer === i ? '1' : '0')).join('');
 }
-// Value 0..1 of one physical input ("bN" or "aN-"/"aN+") on a gamepad.
 const STICK_DEADZONE = 0.15;
 function padValue(pad, code) {
   if (!pad || !code) return 0;
@@ -186,7 +214,6 @@ function applyInfoBar() {
   scheduleLogDraw();
 }
 
-// Players section: a controller per player and the keyboard's player.
 const bootPortMask = portMask();
 function renderPlayers() {
   const list = $('players');
@@ -235,7 +262,6 @@ function renderPlayers() {
     row.append(label, controls);
     list.append(row);
   }
-  // The game only sees which controller ports are plugged in at boot.
   const hint = $('players-hint');
   const changed = portMask() !== bootPortMask;
   hint.textContent = changed
@@ -252,7 +278,6 @@ function renderPlayers() {
 }
 
 let bindTab = 'keyboard';
-// While waiting for an input to bind: { kind: 'key'|'pad', canon, slot, button, baseline }.
 let listening = null;
 function stopListening() {
   if (listening) listening.button.classList.remove('listening');
@@ -295,13 +320,11 @@ function renderBinds() {
     list.append(row);
   }
 }
-// code: the new binding, '' to clear, or null to cancel.
 function finishBinding(code) {
   const { kind, canon, slot } = listening;
   listening = null;
   if (code !== null) {
     if (kind === 'key') {
-      // A key drives one control: take it away from any other control first.
       if (code) {
         for (const keys of Object.values(settings.binds))
           for (let i = 0; i < 2; i++) if (keys[i] === code) keys[i] = '';
@@ -319,8 +342,6 @@ function finishBinding(code) {
   }
   renderBinds();
 }
-// Binding a controller input: the first button pressed or stick pushed past half way that was
-// not already held when listening started.
 function watchPadForBinding() {
   if (!listening || listening.kind !== 'pad') return;
   for (const pad of connectedPads()) {
@@ -328,7 +349,6 @@ function watchPadForBinding() {
     pad.buttons.forEach((_, i) => inputs.push(`b${i}`));
     pad.axes.forEach((_, i) => inputs.push(`a${i}-`, `a${i}+`));
     const active = inputs.filter((code) => padValue(pad, code) > 0.5);
-    // Per controller: inputs already held when listening started do not count until released.
     listening.baseline = listening.baseline || new Map();
     if (!listening.baseline.has(pad.index)) listening.baseline.set(pad.index, new Set(active));
     const held = listening.baseline.get(pad.index);
@@ -367,7 +387,6 @@ $('binds-reset').addEventListener('click', () => {
   saveSettings();
   renderBinds();
 });
-// Settings keys are handled before the game sees them (capture phase).
 addEventListener('keydown', (e) => {
   if (listening) {
     e.preventDefault();
@@ -381,7 +400,6 @@ addEventListener('keydown', (e) => {
 }, true);
 applyInfoBar();
 
-// The settings button fades out after a few seconds without mouse movement.
 let idleTimer = 0;
 function wake() {
   document.body.classList.remove('idle');
@@ -392,7 +410,7 @@ addEventListener('mousemove', wake);
 wake();
 
 // ---------------------------------------------------------------------------------------------
-// The disc: always disc.rvz from serve.py, copied into OPFS (the game reads it from there).
+// The disc: 17 split chunks (disc.rvz.part0..part16) streamed into OPFS (ttyd.rvz).
 
 async function opfsRoot() { return navigator.storage.getDirectory(); }
 
@@ -403,8 +421,8 @@ async function storedDisc() {
   } catch { return null; }
 }
 
-// RVZ header: "RVZ\x01" ... and the disc header (game ID) at 0x58.
 async function checkRvz(file) {
+  if (!file || file.size < 0x60) return 'disc.rvz is incomplete or corrupted.';
   const head = new Uint8Array(await file.slice(0, 0x60).arrayBuffer());
   const magic = String.fromCharCode(...head.slice(0, 3));
   const id = String.fromCharCode(...head.slice(0x58, 0x5e));
@@ -413,8 +431,6 @@ async function checkRvz(file) {
   return null;
 }
 
-// Ask the browser to keep this site's storage: otherwise Chrome may evict the 1 GB disc copy
-// whenever the drive runs low on space.
 async function keepStorage() {
   try {
     if (navigator.storage && navigator.storage.persist && !(await navigator.storage.persisted()))
@@ -422,60 +438,80 @@ async function keepStorage() {
   } catch { /* best effort */ }
 }
 
-// Copies disc.rvz into OPFS unless a copy of the same size is already there. Returns an error
-// message, or null once the disc is ready.
+// Probe total expected disc size from HEAD headers on part0 and the final part (part16)
+async function expectedDiscSize() {
+  try {
+    const [firstHead, lastHead] = await Promise.all([
+      nativeFetch(`${DISC_BASE}.part0`, { method: 'HEAD', cache: 'no-store' }),
+      nativeFetch(`${DISC_BASE}.part${DISC_PARTS - 1}`, { method: 'HEAD', cache: 'no-store' }),
+    ]);
+    if (!firstHead.ok || !lastHead.ok) return 0;
+    const chunkLen = Number(firstHead.headers.get('Content-Length')) || 0;
+    const lastLen = Number(lastHead.headers.get('Content-Length')) || 0;
+    if (chunkLen > 0 && lastLen > 0) {
+      return chunkLen * (DISC_PARTS - 1) + lastLen;
+    }
+  } catch { /* fall back to unknown total size */ }
+  return 0;
+}
+
+// Copies disc.rvz.part0..part16 into OPFS unless a valid copy of the same size is already stored.
 async function prepareDisc() {
-  const [response, stored] = await Promise.all([discResponse, storedDisc()]);
-  // Size of the disc on the server (Content-Length; some hosts stream without one).
-  const serverSize = response.ok ? Number(response.headers.get('Content-Length')) || 0 : 0;
+  const [serverSize, stored] = await Promise.all([expectedDiscSize(), storedDisc()]);
   const storedOk = stored && !(await checkRvz(stored));
-  if (storedOk && (!response.ok || !serverSize || stored.size === serverSize)) {
-    discAbort.abort();  // already have it
+  if (storedOk && (!serverSize || stored.size === serverSize)) {
     return null;
-  }
-  if (!response.ok) {
-    return response.status
-      ? `Could not load disc.rvz (HTTP ${response.status}).`
-      : 'Could not reach disc.rvz. Check the connection, then reload.';
   }
 
   await keepStorage();
-  // OPFS writes go to a swap file that replaces the old copy only on close(), so an interrupted
-  // download never leaves a broken disc behind.
   const handle = await (await opfsRoot()).getFileHandle(DISC_NAME, { create: true });
   const writable = await handle.createWritable();
-  const reader = response.body.getReader();
   let done = 0;
-  setProgress(serverSize ? 0 : null);
-  for (;;) {
-    const { value, done: end } = await reader.read();
-    if (end) break;
-    await writable.write(value);
-    done += value.byteLength;
-    if (serverSize) setProgress(done / serverSize);
-    message.textContent = `Downloading the disc into browser storage (first time only): ` +
-        `${(done / 2 ** 20).toFixed(0)}${serverSize ? ` / ${(serverSize / 2 ** 20).toFixed(0)}` : ''} MiB`;
+  setProgress(0);
+
+  try {
+    for (let i = 0; i < DISC_PARTS; i++) {
+      const partUrl = `${DISC_BASE}.part${i}`;
+      const response = await nativeFetch(partUrl, { cache: 'no-store' });
+      if (!response.ok) {
+        await writable.abort();
+        return response.status
+          ? `Could not load ${partUrl} (HTTP ${response.status}).`
+          : `Could not reach ${partUrl}. Check the connection, then reload.`;
+      }
+
+      const reader = response.body.getReader();
+      for (;;) {
+        const { value, done: end } = await reader.read();
+        if (end) break;
+        await writable.write(value);
+        done += value.byteLength;
+        const frac = serverSize ? done / serverSize : (i + 0.5) / DISC_PARTS;
+        setProgress(frac);
+        message.textContent =
+          `Downloading the disc into browser storage (first time only, part ${i + 1}/${DISC_PARTS}): ` +
+          `${(done / 2 ** 20).toFixed(0)}${serverSize ? ` / ${(serverSize / 2 ** 20).toFixed(0)}` : ''} MiB`;
+      }
+    }
+    await writable.close();
+  } catch (err) {
+    try { await writable.abort(); } catch { /* ignore */ }
+    return `Disc download failed: ${err && err.message ? err.message : err}`;
   }
-  await writable.close();
+
   setProgress(null);
   return checkRvz(await storedDisc());
 }
 
-// Input: the wasm-side WebInputState (InputCommon/ControllerInterface/Web) holds
-// u8 keys[128], u8 connected[4], f32 buttons[4][17], f32 axes[4][4]. Player N's profile reads
-// gamepad slot N-1 in the standard layout (CONTROLS' pad inputs); the page fills each slot from the
-// keyboard (for the keyboard's player) and the player's controller, through the bindings.
+// Input: the wasm-side WebInputState
 let releaseAllKeys = () => {};
 function startInput(Module) {
   const PADS = 4, BUTTONS = 17, AXES = 4;
-  const base = Module._sadx_web_input_state() >>> 0;  // pointers above 2 GB: unsigned
+  const base = Module._sadx_web_input_state() >>> 0;
   const connectedAt = base + 128;
   const buttonsAt = (connectedAt + PADS) >>> 2, axesAt = buttonsAt + PADS * BUTTONS;
-  // The controller's rumble motor (written by Dolphin, 0..1), after the axes.
   const rumbleAt = axesAt + PADS * AXES;
   const rumbleUntil = [0, 0, 0, 0];
-  // Gamepad vibration: Chrome's vibrationActuator, Firefox's hapticActuators. An effect lasts a
-  // short while and is renewed while the motor stays on, so it stops soon after the game stops it.
   const rumble = (pad, port) => {
     const on = Module.HEAPF32[rumbleAt + port] > 0;
     const now = performance.now();
@@ -492,12 +528,11 @@ function startInput(Module) {
     }
   };
 
-
-  const heldKeys = new Set();  // physical keys (KeyboardEvent.code) held now
+  const heldKeys = new Set();
   const onKey = (e, down) => {
     if (!keyMap.has(e.code)) return;
     e.preventDefault();
-    if (down && !settingsOpen) heldKeys.add(e.code);  // no game input while the settings are open
+    if (down && !settingsOpen) heldKeys.add(e.code);
     else heldKeys.delete(e.code);
   };
   addEventListener('keydown', (e) => onKey(e, true));
@@ -534,8 +569,7 @@ function startInput(Module) {
   requestAnimationFrame(poll);
 }
 
-// Saves: the memory card file lives in IndexedDB "ttyd-save-files" (store "cards", key = file
-// name). It is written into the wasm file system before boot and stored again on every flush.
+// Saves: IndexedDB "ttyd-save-files"
 const SAVE_DB = 'ttyd-save-files', SAVE_STORE = 'cards';
 function saveDb() {
   return new Promise((resolve, reject) => {
@@ -564,8 +598,6 @@ async function storeSave(name, data) {
   db.transaction(SAVE_STORE, 'readwrite').objectStore(SAVE_STORE).put(data, name);
   log(`[page] saved ${name} to IndexedDB (${SAVE_DB})`);
 }
-// Keys with a slash are paths under /user (the shader UID cache, "Cache/G8ME01.uidcache");
-// plain names are memory card files in /user/GC.
 function savePath(name) { return name.includes('/') ? '/user/' + name : '/user/GC/' + name; }
 function restoreSaves(Module, saves) {
   for (const [name, data] of saves) {
@@ -580,13 +612,10 @@ function restoreSaves(Module, saves) {
   }
 }
 
-// Shader UID cache: Dolphin appends every pipeline the game uses to /user/Cache/G8ME01.uidcache
-// and compiles everything listed there before the game starts. Keep it in IndexedDB so each
-// session pre-compiles what earlier sessions needed. A starter list ships with the site.
 const SHADER_CACHE_KEY = 'Cache/G8ME01.uidcache';
 async function starterShaderCache() {
   try {
-    const response = await fetch('G8ME01.uidcache');
+    const response = await nativeFetch('G8ME01.uidcache');
     return response.ok ? new Uint8Array(await response.arrayBuffer()) : null;
   } catch { return null; }
 }
@@ -613,7 +642,6 @@ function keepShaderCache(Module) {
   }, 15000);
 }
 
-// Audio: an AudioWorklet reads the shared ring Dolphin's WebAudio backend fills (48 kHz stereo).
 async function startAudio(Module, ctx) {
   await ctx.audioWorklet.addModule('ttyd-audio-worklet.js');
   const node = new AudioWorkletNode(ctx, 'sadx-audio', { outputChannelCount: [2] });
@@ -621,14 +649,15 @@ async function startAudio(Module, ctx) {
   node.connect(ctx.destination);
 }
 
-// audioCtx: may still be suspended until the first input (or null for ?mute=1); the disc is
-// already in OPFS. The game is loaded right away; it starts running once `ready` resolves.
 async function start(audioCtx, ready = Promise.resolve()) {
   status('Loading the game code...');
   const params = new URLSearchParams(location.search);
   const video = params.get('video') || 'OGL';
   const displayCtx = $('display').getContext('bitmaprenderer');
-  const saves = await loadSaves().catch(() => []);
+  const [saves, wasmBuffer] = await Promise.all([
+    loadSaves().catch(() => []),
+    getMergedWasmBuffer(),
+  ]);
   if (!saves.some(([name]) => name === SHADER_CACHE_KEY)) {
     const starter = await starterShaderCache();
     if (starter) saves.push([SHADER_CACHE_KEY, starter]);
@@ -639,9 +668,16 @@ async function start(audioCtx, ready = Promise.resolve()) {
     print: (t) => log(t),
     printErr: (t) => log(t),
     locateFile: (path) => path,
+    instantiateWasm: (imports, successCallback) => {
+      WebAssembly.instantiate(wasmBuffer, imports)
+        .then((result) => successCallback(result.instance, result.module))
+        .catch((err) => {
+          log(`[page] wasm instantiate failed: ${err.message}`);
+          message.textContent = `WebAssembly failed to start: ${err.message}`;
+        });
+      return {};
+    },
     onMemoryCardWrite: (name, data) => storeSave(name, data),
-    // Each finished frame arrives as an ImageBitmap from the renderer thread, which sends at
-    // most two ahead (framesInFlight, shared with it) so a busy page never piles them up.
     sadxPresent: (frame) => {
       window.sadxFrames = (window.sadxFrames || 0) + 1;
       fpsFrames++;
@@ -652,22 +688,16 @@ async function start(audioCtx, ready = Promise.resolve()) {
         frame.close();
         log(`[page] could not show a frame: ${e.message}`);
       } finally {
-        // Always acknowledge, or the renderer would wait on this frame forever.
         if (framesInFlight) Atomics.sub(framesInFlight, 0, 1);
       }
       noteFrameGap();
     },
-    // The browser reset the GPU: the renderer's WebGL objects are gone for good.
     sadxContextLost: () => showGraphicsReset(),
   });
   framesInFlight = new Int32Array(Module.HEAPU8.buffer, Module._sadx_web_frames_in_flight(), 1);
   watchGpuReset();
-  window.sadxModule = Module;  // debugging from the console
+  window.sadxModule = Module;
   restoreSaves(Module, saves);
-  // ?cpuclock=N (percent of the GameCube's 486 MHz): Dolphin's CPU clock override for this game.
-  // Below 100 the emulated console's clock keeps up with real time on a machine that cannot run
-  // the game's work in full: the game drops frames, as on a slower console, instead of everything
-  // (music included) slowing down.
   const cpuClock = Number(params.get('cpuclock'));
   if (cpuClock > 0 && cpuClock <= 400) {
     const ini = `[Core]\nOverclockEnable = True\nOverclock = ${(cpuClock / 100).toFixed(2)}\n`;
@@ -675,7 +705,6 @@ async function start(audioCtx, ready = Promise.resolve()) {
     log(`[page] CPU clock ${cpuClock}%`);
   }
   keepShaderCache(Module);
-  // Pause button: the game stops at its next polling point; the sound output is suspended too.
   const pauseButton = $('pause');
   let paused = false;
   pauseButton.addEventListener('click', () => {
@@ -689,15 +718,12 @@ async function start(audioCtx, ready = Promise.resolve()) {
     $('display').focus();
   });
   startInput(Module);
-  // ?mute=1: no audio at all (testing).
   if (!audioCtx) {
-    // Silent, but keep draining the ring so the mixer behaves as it does with sound.
     const header = new Uint32Array(Module.HEAPU8.buffer, Module._sadx_web_audio_ring(), 3);
     setInterval(() => Atomics.store(header, 1, Atomics.load(header, 2)), 20);
   }
   else startAudio(Module, audioCtx).catch((e) => log(`[page] audio unavailable: ${e.message}`));
   status('Starting the game...');
-  // ?noframelimit: no speed cap (the game runs as fast as this machine can; default is normal speed).
   const debug = [params.get('debug'), params.has('noframelimit') ? 'noframelimit' : ''].filter(Boolean).join(',');
   await ready;
   Module.callMain(['/opfs/' + DISC_NAME, video, params.get('shaders') || 'spec', params.get('scale') || '1',
@@ -707,17 +733,12 @@ async function start(audioCtx, ready = Promise.resolve()) {
 
 let framesInFlight = null;
 
-// FPS counter (Settings > Show FPS counter): frames shown on the page in the last second.
 let fpsFrames = 0;
 setInterval(() => {
   if (settings.showFps) $('fps').textContent = `${fpsFrames} FPS`;
   fpsFrames = 0;
 }, 1000);
 
-// The renderer thread never returns to its event loop, so its WebGL context cannot learn that
-// the browser's GPU process was reset (Chrome marks a context lost from a task on its thread).
-// A GPU process reset loses every context in the tab, so a tiny context owned by this page
-// receives the event for it.
 let gpuSentinel = null;
 function watchGpuReset() {
   const canvas = document.createElement('canvas');
@@ -727,8 +748,6 @@ function watchGpuReset() {
   canvas.addEventListener('webglcontextlost', () => showGraphicsReset(), { once: true });
 }
 
-// The GPU was reset under the game (driver or browser): nothing can be drawn any more, so offer
-// a reload. Memory card saves are already in IndexedDB.
 let graphicsResetShown = false;
 function showGraphicsReset() {
   if (graphicsResetShown) return;
@@ -741,8 +760,6 @@ function showGraphicsReset() {
   startHint.onclick = () => location.reload();
 }
 
-// Freeze diagnosis: every gap of more than 250 ms between presented frames goes to the log
-// (and window.sadxHitches) with the line logged just before it.
 let lastFrameAt = 0;
 function noteFrameGap() {
   const now = performance.now();
@@ -756,8 +773,6 @@ function noteFrameGap() {
 }
 document.addEventListener('visibilitychange', () => { lastFrameAt = 0; });
 
-// Ids of the REL modules the game has loaded, read from the OS module list in guest RAM
-// (head pointer at 0x800030C8; each module starts with its id, then the next pointer).
 function loadedModules(Module) {
   const ids = [];
   const read32 = (address) => {
@@ -770,21 +785,19 @@ function loadedModules(Module) {
   }
   return ids;
 }
-window.sadxLoadedModules = () => loadedModules(window.sadxModule);  // debugging from the console
+window.sadxLoadedModules = () => loadedModules(window.sadxModule);
 
-
-// Boot: copy disc.rvz into browser storage if needed, then start. Browsers only let a page play
-// sound after a click or key press on it, so until the first one the audio context stays
-// suspended (the game runs and fills the ring meanwhile) and resumes on that first input.
 (async () => {
   if (!crossOriginIsolated) {
     message.textContent = 'This page needs cross-origin isolation for threads. Open it through serve.py.';
     return;
   }
+  // Start fetching the 5 wasm chunks in parallel while the disc downloads/verifies
+  getMergedWasmBuffer().catch(() => {});
   const problem = await prepareDisc();
   if (problem) { message.textContent = problem; return; }
   keepStorage();
-  if (new URLSearchParams(location.search).get('mute')) { start(null); return; }  // testing, no intro
+  if (new URLSearchParams(location.search).get('mute')) { start(null); return; }
   const audioCtx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
   if (audioCtx.state !== 'running') {
     const resume = () => {
@@ -799,9 +812,6 @@ window.sadxLoadedModules = () => loadedModules(window.sadxModule);  // debugging
   start(audioCtx, playIntro());
 })();
 
-// The GameCube startup screen (loading.mp4), shown while the game loads behind it. Browsers only
-// autoplay sound after the page has had a click or key press, so without one it plays muted.
-// Resolves when it has finished (or cannot play at all).
 function playIntro() {
   const video = $('intro');
   return new Promise((resolve) => {
@@ -809,8 +819,7 @@ function playIntro() {
       video.pause();
       video.hidden = true;
       video.removeAttribute('src');
-      video.load();  // frees the decoder
-      // Until the game's first frame, the loading card shows what it is doing.
+      video.load();
       if (!window.sadxFrames) {
         message.textContent = statusEl.textContent || 'Starting the game...';
         overlay.classList.remove('hidden');
