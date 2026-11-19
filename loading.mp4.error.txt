@@ -1,0 +1,2 @@
+URL: https://nostaligafun.pages.dev/games/games-accualy/GC/PaperMarioTheThousandYearDoor_Data/loading.mp4
+Error: HTTP 304
